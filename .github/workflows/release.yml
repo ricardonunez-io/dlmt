@@ -1,0 +1,189 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: dlmt-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: dlmt-macos-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: dlmt-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: dlmt-linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: compile
+        run: |
+          mkdir -p dist
+          deno compile \
+            --allow-net --allow-read --allow-write --allow-env \
+            --target ${{ matrix.target }} \
+            --output dist/dlmt \
+            main.ts
+
+      - name: package tarball
+        run: |
+          cd dist
+          mv dlmt ${{ matrix.asset }}
+          tar -czf ${{ matrix.asset }}.tar.gz ${{ matrix.asset }}
+          shasum -a 256 ${{ matrix.asset }}.tar.gz > ${{ matrix.asset }}.tar.gz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}.tar.gz
+            dist/${{ matrix.asset }}.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: collect
+        run: |
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+          find artifacts -name '*.sha256' -exec cat {} + > release/SHA256SUMS
+          ls -la release
+
+      - name: version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS
+          generate_release_notes: true
+
+  update-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: ricardonunez-io/homebrew-dlmt
+          token: ${{ secrets.TAP_TOKEN }}
+          path: tap
+
+      - name: download checksums
+        run: |
+          gh release download "v${{ needs.release.outputs.version }}" \
+            --repo ricardonunez-io/dlmt \
+            --pattern 'SHA256SUMS' \
+            --dir .
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+
+      - name: render formula
+        run: |
+          VERSION="${{ needs.release.outputs.version }}"
+          sha() { awk -v f="$1" '$2==f {print $1}' SHA256SUMS; }
+          SHA_MAC_ARM=$(sha dlmt-macos-arm64.tar.gz)
+          SHA_MAC_X86=$(sha dlmt-macos-x86_64.tar.gz)
+          SHA_LIN_X86=$(sha dlmt-linux-x86_64.tar.gz)
+          SHA_LIN_ARM=$(sha dlmt-linux-arm64.tar.gz)
+
+          mkdir -p tap/Formula
+          cat > tap/Formula/dlmt.rb <<EOF
+          class Dlmt < Formula
+            desc "Download a site's llms.txt and all linked markdown/JSON/YAML resources"
+            homepage "https://github.com/ricardonunez-io/dlmt"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/ricardonunez-io/dlmt/releases/download/v${VERSION}/dlmt-macos-arm64.tar.gz"
+                sha256 "${SHA_MAC_ARM}"
+
+                def install
+                  bin.install "dlmt-macos-arm64" => "dlmt"
+                  %w[download-llmstxt dl-llmstxt dl-mintlify download-mintlify].each do |a|
+                    bin.install_symlink "dlmt" => a
+                  end
+                end
+              end
+              on_intel do
+                url "https://github.com/ricardonunez-io/dlmt/releases/download/v${VERSION}/dlmt-macos-x86_64.tar.gz"
+                sha256 "${SHA_MAC_X86}"
+
+                def install
+                  bin.install "dlmt-macos-x86_64" => "dlmt"
+                  %w[download-llmstxt dl-llmstxt dl-mintlify download-mintlify].each do |a|
+                    bin.install_symlink "dlmt" => a
+                  end
+                end
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/ricardonunez-io/dlmt/releases/download/v${VERSION}/dlmt-linux-arm64.tar.gz"
+                sha256 "${SHA_LIN_ARM}"
+
+                def install
+                  bin.install "dlmt-linux-arm64" => "dlmt"
+                  %w[download-llmstxt dl-llmstxt dl-mintlify download-mintlify].each do |a|
+                    bin.install_symlink "dlmt" => a
+                  end
+                end
+              end
+              on_intel do
+                url "https://github.com/ricardonunez-io/dlmt/releases/download/v${VERSION}/dlmt-linux-x86_64.tar.gz"
+                sha256 "${SHA_LIN_X86}"
+
+                def install
+                  bin.install "dlmt-linux-x86_64" => "dlmt"
+                  %w[download-llmstxt dl-llmstxt dl-mintlify download-mintlify].each do |a|
+                    bin.install_symlink "dlmt" => a
+                  end
+                end
+              end
+            end
+
+            test do
+              assert_match "${VERSION}", shell_output("#{bin}/dlmt --version")
+            end
+          end
+          EOF
+
+      - name: commit and push
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/dlmt.rb
+          git commit -m "dlmt ${{ needs.release.outputs.version }}"
+          git push

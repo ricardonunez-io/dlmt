@@ -1,0 +1,330 @@
+import { parseArgs } from "@std/cli/parse-args";
+import { ensureDir } from "@std/fs/ensure-dir";
+import { dirname, join, relative, resolve, toFileUrl } from "@std/path";
+import { pooledMap } from "@std/async/pool";
+import { remark } from "remark";
+import remarkGfm from "remark-gfm";
+import remarkMdx from "remark-mdx";
+import { visit } from "unist-util-visit";
+
+export const VERSION = "0.1.0";
+
+const DOWNLOADABLE_EXTENSIONS = new Set([
+  ".md",
+  ".mdx",
+  ".json",
+  ".yaml",
+  ".yml",
+]);
+
+export interface CollectedLink {
+  kind: "link" | "definition";
+  node: { url: string };
+  href: string;
+}
+
+export function createProcessor() {
+  return remark().use(remarkGfm).use(remarkMdx);
+}
+
+export function parseLlmsTxt(md: string) {
+  return createProcessor().parse(md);
+}
+
+export function collectLinks(tree: unknown): CollectedLink[] {
+  const out: CollectedLink[] = [];
+  visit(tree as never, (node: { type: string; url?: string }) => {
+    if (node.type === "link" && typeof node.url === "string") {
+      out.push({ kind: "link", node: node as { url: string }, href: node.url });
+    } else if (node.type === "definition" && typeof node.url === "string") {
+      out.push({
+        kind: "definition",
+        node: node as { url: string },
+        href: node.url,
+      });
+    }
+  });
+  return out;
+}
+
+export function hasDownloadableExtension(href: string): boolean {
+  let path = href;
+  const hashIdx = path.indexOf("#");
+  if (hashIdx !== -1) path = path.slice(0, hashIdx);
+  const queryIdx = path.indexOf("?");
+  if (queryIdx !== -1) path = path.slice(0, queryIdx);
+  const dotIdx = path.lastIndexOf(".");
+  if (dotIdx === -1) return false;
+  const ext = path.slice(dotIdx).toLowerCase();
+  return DOWNLOADABLE_EXTENSIONS.has(ext);
+}
+
+export function filterDownloadable(links: CollectedLink[]): CollectedLink[] {
+  return links.filter((l) => hasDownloadableExtension(l.href));
+}
+
+export function resolveHref(href: string, baseUrl?: string): URL {
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(href)) {
+    return new URL(href);
+  }
+  if (!baseUrl) {
+    throw new Error(
+      `Cannot resolve relative href "${href}" without a base URL. Pass --base-url.`,
+    );
+  }
+  return new URL(href, baseUrl);
+}
+
+export function urlToLocalPath(url: URL, outDir: string): string {
+  let pathname = decodeURIComponent(url.pathname);
+  if (pathname.startsWith("/")) pathname = pathname.slice(1);
+  if (pathname === "" || pathname.endsWith("/")) {
+    pathname = pathname + "index";
+  }
+  return join(outDir, pathname);
+}
+
+export interface DownloadPlanItem {
+  href: string;
+  url: URL;
+  localPath: string;
+  node: { url: string };
+}
+
+export interface DownloadResult {
+  item: DownloadPlanItem;
+  ok: boolean;
+  error?: string;
+}
+
+export interface DownloadOptions {
+  concurrency: number;
+  noClobber: boolean;
+  fetchFn?: typeof fetch;
+  onResult?: (r: DownloadResult) => void;
+}
+
+export async function downloadOne(
+  item: DownloadPlanItem,
+  opts: DownloadOptions,
+): Promise<DownloadResult> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  try {
+    if (opts.noClobber) {
+      try {
+        await Deno.stat(item.localPath);
+        return { item, ok: true };
+      } catch (_) {
+        // not exists, continue
+      }
+    }
+    const res = await fetchFn(item.url);
+    if (!res.ok) {
+      return { item, ok: false, error: `HTTP ${res.status}` };
+    }
+    const body = new Uint8Array(await res.arrayBuffer());
+    await ensureDir(dirname(item.localPath));
+    await Deno.writeFile(item.localPath, body);
+    return { item, ok: true };
+  } catch (err) {
+    return { item, ok: false, error: (err as Error).message };
+  }
+}
+
+export async function downloadAll(
+  plan: DownloadPlanItem[],
+  opts: DownloadOptions,
+): Promise<DownloadResult[]> {
+  const results: DownloadResult[] = [];
+  const iter = pooledMap(
+    opts.concurrency,
+    plan,
+    (item) => downloadOne(item, opts),
+  );
+  for await (const r of iter) {
+    if (opts.onResult) opts.onResult(r);
+    results.push(r);
+  }
+  return results;
+}
+
+export function rewriteNodes(
+  plan: DownloadPlanItem[],
+  llmsTxtDir: string,
+): void {
+  for (const item of plan) {
+    const rel = relative(llmsTxtDir, item.localPath);
+    const normalized = rel.split("\\").join("/");
+    item.node.url = normalized.startsWith(".") ? normalized : "./" + normalized;
+  }
+}
+
+export function stringifyTree(tree: unknown): string {
+  return String(createProcessor().stringify(tree as never));
+}
+
+function isUrl(source: string): boolean {
+  return /^https?:\/\//i.test(source);
+}
+
+async function loadSource(
+  source: string,
+  fetchFn: typeof fetch,
+): Promise<{ text: string; baseUrl?: string }> {
+  if (isUrl(source)) {
+    const res = await fetchFn(source);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch ${source}: HTTP ${res.status}`);
+    }
+    return { text: await res.text(), baseUrl: source };
+  }
+  const abs = resolve(source);
+  const text = await Deno.readTextFile(abs);
+  return { text, baseUrl: toFileUrl(abs).href };
+}
+
+const HELP = `dlmt ${VERSION}
+
+Download an llms.txt index and all linked markdown/JSON/YAML resources.
+
+USAGE:
+  dlmt <source> [options]
+
+ARGS:
+  <source>              Path or URL to an llms.txt file.
+
+OPTIONS:
+  -o, --out <dir>       Output directory (default: current working directory).
+      --base-url <url>  Base URL for resolving relative links in a local llms.txt.
+  -c, --concurrency <n> Max concurrent downloads (default: 10).
+      --no-clobber      Skip files that already exist locally.
+  -h, --help            Show this help.
+  -v, --version         Show version.
+
+EXAMPLES:
+  dlmt https://mintlify.com/docs/llms.txt -o ./docs
+  dlmt ./llms.txt --base-url https://mintlify.com -o out -c 20
+`;
+
+export interface RunOptions {
+  source: string;
+  outDir: string;
+  baseUrl?: string;
+  concurrency: number;
+  noClobber: boolean;
+  fetchFn?: typeof fetch;
+  log?: (msg: string) => void;
+}
+
+export async function run(opts: RunOptions): Promise<{
+  written: number;
+  failed: number;
+  skipped: number;
+  results: DownloadResult[];
+}> {
+  const fetchFn = opts.fetchFn ?? fetch;
+  const log = opts.log ?? ((m) => console.log(m));
+
+  const { text, baseUrl: detectedBase } = await loadSource(opts.source, fetchFn);
+  const baseUrl = opts.baseUrl ?? detectedBase;
+
+  const tree = parseLlmsTxt(text);
+  const links = filterDownloadable(collectLinks(tree));
+
+  const plan: DownloadPlanItem[] = [];
+  let skipped = 0;
+  for (const link of links) {
+    try {
+      const url = resolveHref(link.href, baseUrl);
+      if (url.protocol !== "http:" && url.protocol !== "https:") {
+        skipped++;
+        continue;
+      }
+      const localPath = urlToLocalPath(url, opts.outDir);
+      plan.push({ href: link.href, url, localPath, node: link.node });
+    } catch (err) {
+      log(`skip: ${link.href} (${(err as Error).message})`);
+      skipped++;
+    }
+  }
+
+  await ensureDir(opts.outDir);
+  log(`Downloading ${plan.length} files to ${opts.outDir}...`);
+
+  const results = await downloadAll(plan, {
+    concurrency: opts.concurrency,
+    noClobber: opts.noClobber,
+    fetchFn,
+    onResult: (r) => {
+      if (r.ok) log(`  ok   ${r.item.url}`);
+      else log(`  FAIL ${r.item.url} (${r.error})`);
+    },
+  });
+
+  const successful = plan.filter((_, i) => results[i].ok);
+  rewriteNodes(successful, opts.outDir);
+  const rewritten = stringifyTree(tree);
+  await Deno.writeTextFile(join(opts.outDir, "llms.txt"), rewritten);
+
+  const written = results.filter((r) => r.ok).length;
+  const failed = results.filter((r) => !r.ok).length;
+  log(`Done. ${written} written, ${failed} failed, ${skipped} skipped.`);
+
+  return { written, failed, skipped, results };
+}
+
+export async function main(argv: string[]): Promise<number> {
+  const args = parseArgs(argv, {
+    string: ["out", "base-url", "concurrency"],
+    boolean: ["help", "version", "no-clobber"],
+    alias: {
+      h: "help",
+      v: "version",
+      o: "out",
+      c: "concurrency",
+    },
+    default: {
+      "no-clobber": false,
+    },
+  });
+
+  if (args.help) {
+    console.log(HELP);
+    return 0;
+  }
+  if (args.version) {
+    console.log(VERSION);
+    return 0;
+  }
+
+  const source = args._[0];
+  if (typeof source !== "string" || source.length === 0) {
+    console.error("error: missing <source> argument\n");
+    console.error(HELP);
+    return 2;
+  }
+
+  const concurrency = args.concurrency ? Number(args.concurrency) : 10;
+  if (!Number.isFinite(concurrency) || concurrency <= 0) {
+    console.error(`error: invalid --concurrency: ${args.concurrency}`);
+    return 2;
+  }
+
+  try {
+    const res = await run({
+      source,
+      outDir: args.out ? resolve(args.out) : Deno.cwd(),
+      baseUrl: args["base-url"],
+      concurrency,
+      noClobber: args["no-clobber"],
+    });
+    return res.failed > 0 ? 1 : 0;
+  } catch (err) {
+    console.error(`error: ${(err as Error).message}`);
+    return 1;
+  }
+}
+
+if (import.meta.main) {
+  Deno.exit(await main(Deno.args));
+}
