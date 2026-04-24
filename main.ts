@@ -7,7 +7,17 @@ import remarkGfm from "remark-gfm";
 import remarkMdx from "remark-mdx";
 import { visit } from "unist-util-visit";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
+
+const ACCEPT_HEADER = "text/markdown";
+
+function fetchWithAccept(fetchFn: typeof fetch): typeof fetch {
+  return ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    if (!headers.has("accept")) headers.set("accept", ACCEPT_HEADER);
+    return fetchFn(input, { ...init, headers });
+  }) as typeof fetch;
+}
 
 const DOWNLOADABLE_EXTENSIONS = new Set([
   ".md",
@@ -108,7 +118,7 @@ export async function downloadOne(
   item: DownloadPlanItem,
   opts: DownloadOptions,
 ): Promise<DownloadResult> {
-  const fetchFn = opts.fetchFn ?? fetch;
+  const fetchFn = fetchWithAccept(opts.fetchFn ?? fetch);
   try {
     if (opts.noClobber) {
       try {
@@ -222,7 +232,7 @@ export async function run(opts: RunOptions): Promise<{
   skipped: number;
   results: DownloadResult[];
 }> {
-  const fetchFn = opts.fetchFn ?? fetch;
+  const fetchFn = fetchWithAccept(opts.fetchFn ?? fetch);
   const log = opts.log ?? ((m) => console.log(m));
 
   const { text, baseUrl: detectedBase } = await loadSource(opts.source, fetchFn);

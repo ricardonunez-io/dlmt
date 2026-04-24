@@ -329,3 +329,35 @@ Deno.test("run: throws on unreachable source URL", async () => {
     "Failed to fetch",
   );
 });
+
+Deno.test("run: sends Accept: text/markdown header on all fetches", async () => {
+  await withTempDir(async (dir) => {
+    const llmsTxt = "[a](https://example.com/a.md)\n";
+    const seenAccept: string[] = [];
+    const fetchFn = ((input: string | URL | Request, init?: RequestInit) => {
+      const headers = new Headers(init?.headers);
+      seenAccept.push(headers.get("accept") ?? "");
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+        ? input.href
+        : input.url;
+      if (url === "https://example.com/llms.txt") {
+        return Promise.resolve(new Response(llmsTxt));
+      }
+      return Promise.resolve(new Response("A"));
+    }) as unknown as typeof fetch;
+
+    await run({
+      source: "https://example.com/llms.txt",
+      outDir: dir,
+      concurrency: 2,
+      noClobber: false,
+      fetchFn,
+      log: () => {},
+    });
+
+    assertEquals(seenAccept.length, 2);
+    for (const a of seenAccept) assertEquals(a, "text/markdown");
+  });
+});
