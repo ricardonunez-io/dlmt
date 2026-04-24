@@ -65,13 +65,22 @@ export function collectLinks(tree: unknown): CollectedLink[] {
 export function hasDownloadableExtension(href: string): boolean {
   let path = href;
   const hashIdx = path.indexOf("#");
-  if (hashIdx !== -1) path = path.slice(0, hashIdx);
+  let fragment = "";
+  if (hashIdx !== -1) {
+    fragment = path.slice(hashIdx + 1);
+    path = path.slice(0, hashIdx);
+  }
   const queryIdx = path.indexOf("?");
   if (queryIdx !== -1) path = path.slice(0, queryIdx);
-  const dotIdx = path.lastIndexOf(".");
-  if (dotIdx === -1) return false;
-  const ext = path.slice(dotIdx).toLowerCase();
-  return DOWNLOADABLE_EXTENSIONS.has(ext);
+  const check = (s: string): boolean => {
+    const dotIdx = s.lastIndexOf(".");
+    if (dotIdx === -1) return false;
+    const ext = s.slice(dotIdx).toLowerCase();
+    return DOWNLOADABLE_EXTENSIONS.has(ext);
+  };
+  if (check(path)) return true;
+  if (fragment && check(fragment)) return true;
+  return false;
 }
 
 export function filterDownloadable(links: CollectedLink[]): CollectedLink[] {

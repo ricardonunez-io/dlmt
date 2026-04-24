@@ -32,6 +32,12 @@ Deno.test("hasDownloadableExtension: ignores query and hash", () => {
   assert(!hasDownloadableExtension("https://x.com/a?x=.md"));
 });
 
+Deno.test("hasDownloadableExtension: accepts .md fragment hint", () => {
+  assert(hasDownloadableExtension("https://x.com/docs/delete#delete.md"));
+  assert(hasDownloadableExtension("https://x.com/docs/page#anchor.mdx"));
+  assert(!hasDownloadableExtension("https://x.com/docs/page#section"));
+});
+
 Deno.test("collectLinks: plain and reference-style", () => {
   const md = [
     "# Title",
@@ -458,5 +464,49 @@ Deno.test("run: converts HTML response to markdown and swaps extension", async (
 
     const rewritten = await Deno.readTextFile(join(dir, "llms.txt"));
     assert(rewritten.includes("./a.md"), rewritten);
+  });
+});
+
+Deno.test("run: downloads and rewrites fragment-hint URLs (e.g. /page#name.md)", async () => {
+  await withTempDir(async (dir) => {
+    const llmsTxt =
+      "[a](https://example.com/docs/delete#delete.md)\n[b](https://example.com/docs/get#get.md)\n";
+    const fetchFn = ((input: string | URL | Request) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+        ? input.href
+        : input.url;
+      if (url === "https://example.com/llms.txt") {
+        return Promise.resolve(
+          new Response(llmsTxt, {
+            headers: { "content-type": "text/markdown" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          "<!DOCTYPE html><html><body><article><h1>Page</h1></article></body></html>",
+          { headers: { "content-type": "text/html; charset=utf-8" } },
+        ),
+      );
+    }) as unknown as typeof fetch;
+
+    const res = await run({
+      source: "https://example.com/llms.txt",
+      outDir: dir,
+      concurrency: 2,
+      noClobber: false,
+      fetchFn,
+      log: () => {},
+    });
+
+    assertEquals(res.written, 2);
+    assertEquals(res.failed, 0);
+
+    const rewritten = await Deno.readTextFile(join(dir, "llms.txt"));
+    assert(rewritten.includes("./docs/delete.md"), rewritten);
+    assert(rewritten.includes("./docs/get.md"), rewritten);
+    assert(!rewritten.includes("https://example.com/docs/"), rewritten);
   });
 });
