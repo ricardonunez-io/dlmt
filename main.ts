@@ -12,7 +12,7 @@ import { visit } from "unist-util-visit";
 import { select } from "hast-util-select";
 import { toMdast } from "hast-util-to-mdast";
 
-export const VERSION = "0.1.4";
+export const VERSION = "0.1.5";
 
 const ACCEPT_HEADER = "text/markdown";
 
@@ -24,12 +24,50 @@ function fetchWithAccept(fetchFn: typeof fetch): typeof fetch {
   }) as typeof fetch;
 }
 
-const DOWNLOADABLE_EXTENSIONS = new Set([
-  ".md",
-  ".mdx",
-  ".json",
-  ".yaml",
-  ".yml",
+const NON_DOCUMENT_EXTENSIONS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".svg",
+  ".ico",
+  ".bmp",
+  ".tiff",
+  ".avif",
+  ".mp4",
+  ".webm",
+  ".mov",
+  ".avi",
+  ".mkv",
+  ".mp3",
+  ".wav",
+  ".ogg",
+  ".flac",
+  ".zip",
+  ".tar",
+  ".gz",
+  ".tgz",
+  ".bz2",
+  ".xz",
+  ".7z",
+  ".rar",
+  ".pdf",
+  ".exe",
+  ".dmg",
+  ".pkg",
+  ".deb",
+  ".rpm",
+  ".msi",
+  ".woff",
+  ".woff2",
+  ".ttf",
+  ".otf",
+  ".eot",
+  ".css",
+  ".js",
+  ".mjs",
+  ".wasm",
 ]);
 
 export interface CollectedLink {
@@ -48,21 +86,43 @@ export function parseLlmsTxt(md: string) {
 
 export function collectLinks(tree: unknown): CollectedLink[] {
   const out: CollectedLink[] = [];
+  const seen = new WeakSet<object>();
+
+  const walk = (node: { type: string; children?: unknown[]; url?: string }, inListItem: boolean) => {
+    if (inListItem) {
+      if (node.type === "link" && typeof node.url === "string") {
+        if (!seen.has(node)) {
+          seen.add(node);
+          out.push({ kind: "link", node: node as { url: string }, href: node.url });
+        }
+      }
+    }
+    const nextInListItem = inListItem || node.type === "listItem";
+    const children = node.children;
+    if (Array.isArray(children)) {
+      for (const child of children) {
+        walk(child as { type: string; children?: unknown[]; url?: string }, nextInListItem);
+      }
+    }
+  };
+  walk(tree as { type: string; children?: unknown[]; url?: string }, false);
+
   visit(tree as never, (node: { type: string; url?: string }) => {
-    if (node.type === "link" && typeof node.url === "string") {
-      out.push({ kind: "link", node: node as { url: string }, href: node.url });
-    } else if (node.type === "definition" && typeof node.url === "string") {
-      out.push({
-        kind: "definition",
-        node: node as { url: string },
-        href: node.url,
-      });
+    if (node.type === "definition" && typeof node.url === "string") {
+      if (!seen.has(node)) {
+        seen.add(node);
+        out.push({
+          kind: "definition",
+          node: node as { url: string },
+          href: node.url,
+        });
+      }
     }
   });
   return out;
 }
 
-export function hasDownloadableExtension(href: string): boolean {
+function parseHref(href: string): { path: string; fragment: string } {
   let path = href;
   const hashIdx = path.indexOf("#");
   let fragment = "";
@@ -72,19 +132,41 @@ export function hasDownloadableExtension(href: string): boolean {
   }
   const queryIdx = path.indexOf("?");
   if (queryIdx !== -1) path = path.slice(0, queryIdx);
-  const check = (s: string): boolean => {
-    const dotIdx = s.lastIndexOf(".");
-    if (dotIdx === -1) return false;
-    const ext = s.slice(dotIdx).toLowerCase();
-    return DOWNLOADABLE_EXTENSIONS.has(ext);
-  };
-  if (check(path)) return true;
-  if (fragment && check(fragment)) return true;
-  return false;
+  return { path, fragment };
+}
+
+function extensionOf(s: string): string | null {
+  const slash = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  const dot = s.lastIndexOf(".");
+  if (dot <= slash) return null;
+  return s.slice(dot).toLowerCase();
+}
+
+export function isLikelyDocument(href: string): boolean {
+  if (href.startsWith("#")) return false;
+  const { path, fragment } = parseHref(href);
+  if (path === "" && fragment === "") return false;
+  if (path === "") return false;
+  const pathExt = extensionOf(path);
+  if (pathExt && NON_DOCUMENT_EXTENSIONS.has(pathExt)) return false;
+  const fragExt = fragment ? extensionOf(fragment) : null;
+  if (fragExt && NON_DOCUMENT_EXTENSIONS.has(fragExt)) return false;
+  return true;
 }
 
 export function filterDownloadable(links: CollectedLink[]): CollectedLink[] {
-  return links.filter((l) => hasDownloadableExtension(l.href));
+  const seenHref = new Set<string>();
+  const out: CollectedLink[] = [];
+  for (const l of links) {
+    if (!isLikelyDocument(l.href)) continue;
+    if (seenHref.has(l.href)) {
+      out.push(l);
+      continue;
+    }
+    seenHref.add(l.href);
+    out.push(l);
+  }
+  return out;
 }
 
 export function resolveHref(href: string, baseUrl?: string): URL {
@@ -108,11 +190,36 @@ export function urlToLocalPath(url: URL, outDir: string): string {
   return join(outDir, pathname);
 }
 
+export function resolvePathCollisions(items: DownloadPlanItem[]): void {
+  const paths = new Set<string>();
+  const pathToItems = new Map<string, DownloadPlanItem[]>();
+  for (const item of items) {
+    paths.add(item.localPath);
+    const arr = pathToItems.get(item.localPath) ?? [];
+    arr.push(item);
+    pathToItems.set(item.localPath, arr);
+  }
+  const prefixes = new Set<string>();
+  for (const p of paths) {
+    const parts = p.split(/[\\/]/);
+    for (let i = 1; i < parts.length; i++) {
+      prefixes.add(parts.slice(0, i).join("/"));
+    }
+  }
+  for (const [p, arr] of pathToItems) {
+    const normalized = p.split(/[\\/]/).join("/");
+    if (prefixes.has(normalized)) {
+      for (const it of arr) it.localPath = join(p, "index");
+    }
+  }
+}
+
 export interface DownloadPlanItem {
   href: string;
   url: URL;
   localPath: string;
   node: { url: string };
+  shared?: DownloadPlanItem;
 }
 
 export interface DownloadResult {
@@ -208,6 +315,16 @@ export async function downloadOne(
       item.localPath = outPath;
       bodyBytes = new TextEncoder().encode(md);
     } else {
+      const ct = (contentType ?? "").toLowerCase();
+      const isMarkdown = ct.includes("text/markdown") ||
+        (!ct && /^\s*#/.test(text));
+      if (isMarkdown) {
+        const ext = extensionOf(item.localPath);
+        if (!ext || (ext !== ".md" && ext !== ".mdx")) {
+          outPath = swapExtensionToMd(item.localPath);
+          item.localPath = outPath;
+        }
+      }
       bodyBytes = new TextEncoder().encode(text);
     }
     await ensureDir(dirname(outPath));
@@ -242,7 +359,12 @@ export function rewriteNodes(
   for (const item of plan) {
     const rel = relative(llmsTxtDir, item.localPath);
     const normalized = rel.split("\\").join("/");
-    item.node.url = normalized.startsWith(".") ? normalized : "./" + normalized;
+    const base = normalized.startsWith(".") ? normalized : "./" + normalized;
+    const hashIdx = item.href.indexOf("#");
+    const frag = hashIdx !== -1 ? item.href.slice(hashIdx) : "";
+    const fragExt = frag ? extensionOf(frag.slice(1)) : null;
+    const keepFrag = frag && !fragExt;
+    item.node.url = keepFrag ? base + frag : base;
   }
 }
 
@@ -319,6 +441,8 @@ export async function run(opts: RunOptions): Promise<{
   const links = filterDownloadable(collectLinks(tree));
 
   const plan: DownloadPlanItem[] = [];
+  const planByKey = new Map<string, DownloadPlanItem>();
+  const allItems: DownloadPlanItem[] = [];
   let skipped = 0;
   for (const link of links) {
     try {
@@ -327,8 +451,28 @@ export async function run(opts: RunOptions): Promise<{
         skipped++;
         continue;
       }
-      const localPath = urlToLocalPath(url, opts.outDir);
-      plan.push({ href: link.href, url, localPath, node: link.node });
+      const key = url.origin + url.pathname + url.search;
+      const existing = planByKey.get(key);
+      if (existing) {
+        allItems.push({
+          href: link.href,
+          url: existing.url,
+          localPath: existing.localPath,
+          node: link.node,
+          shared: existing,
+        });
+      } else {
+        const localPath = urlToLocalPath(url, opts.outDir);
+        const item: DownloadPlanItem = {
+          href: link.href,
+          url,
+          localPath,
+          node: link.node,
+        };
+        planByKey.set(key, item);
+        plan.push(item);
+        allItems.push(item);
+      }
     } catch (err) {
       log(`skip: ${link.href} (${(err as Error).message})`);
       skipped++;
@@ -336,6 +480,10 @@ export async function run(opts: RunOptions): Promise<{
   }
 
   await ensureDir(opts.outDir);
+  resolvePathCollisions(plan);
+  for (const item of allItems) {
+    if (item.shared) item.localPath = item.shared.localPath;
+  }
   log(`Downloading ${plan.length} files to ${opts.outDir}...`);
 
   const results = await downloadAll(plan, {
@@ -348,7 +496,17 @@ export async function run(opts: RunOptions): Promise<{
     },
   });
 
-  const successful = plan.filter((_, i) => results[i].ok);
+  const okByItem = new Map<DownloadPlanItem, boolean>();
+  for (let i = 0; i < plan.length; i++) okByItem.set(plan[i], results[i].ok);
+
+  const successful: DownloadPlanItem[] = [];
+  for (const item of allItems) {
+    const root = item.shared ?? item;
+    if (okByItem.get(root)) {
+      item.localPath = root.localPath;
+      successful.push(item);
+    }
+  }
   rewriteNodes(successful, opts.outDir);
   const rewritten = stringifyTree(tree);
   await Deno.writeTextFile(join(opts.outDir, "llms.txt"), rewritten);

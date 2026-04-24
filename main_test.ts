@@ -3,9 +3,9 @@ import { join } from "@std/path";
 import {
   collectLinks,
   filterDownloadable,
-  hasDownloadableExtension,
   htmlToMarkdown,
   isHtmlResponse,
+  isLikelyDocument,
   parseLlmsTxt,
   resolveHref,
   rewriteNodes,
@@ -15,54 +15,64 @@ import {
   urlToLocalPath,
 } from "./main.ts";
 
-Deno.test("hasDownloadableExtension: md/mdx/json/yaml/yml", () => {
-  assert(hasDownloadableExtension("https://x.com/a.md"));
-  assert(hasDownloadableExtension("https://x.com/a.mdx"));
-  assert(hasDownloadableExtension("https://x.com/a.json"));
-  assert(hasDownloadableExtension("https://x.com/a.yaml"));
-  assert(hasDownloadableExtension("https://x.com/a.yml"));
-  assert(!hasDownloadableExtension("https://x.com/a.html"));
-  assert(!hasDownloadableExtension("https://x.com/a"));
+Deno.test("isLikelyDocument: accepts anything without a non-doc extension", () => {
+  assert(isLikelyDocument("https://x.com/a.md"));
+  assert(isLikelyDocument("https://x.com/a.mdx"));
+  assert(isLikelyDocument("https://x.com/a.json"));
+  assert(isLikelyDocument("https://x.com/a.yaml"));
+  assert(isLikelyDocument("https://x.com/a.yml"));
+  assert(isLikelyDocument("https://x.com/a.html"));
+  assert(isLikelyDocument("https://x.com/a"));
+  assert(isLikelyDocument("https://x.com/docs/intro"));
+  assert(isLikelyDocument("https://x.com/"));
 });
 
-Deno.test("hasDownloadableExtension: ignores query and hash", () => {
-  assert(hasDownloadableExtension("https://x.com/a.md?x=1"));
-  assert(hasDownloadableExtension("https://x.com/a.md#frag"));
-  assert(hasDownloadableExtension("https://x.com/a.md?x=1#frag"));
-  assert(!hasDownloadableExtension("https://x.com/a?x=.md"));
+Deno.test("isLikelyDocument: rejects assets and fragment-only", () => {
+  assert(!isLikelyDocument("https://x.com/img.png"));
+  assert(!isLikelyDocument("https://x.com/logo.svg"));
+  assert(!isLikelyDocument("https://x.com/video.mp4"));
+  assert(!isLikelyDocument("https://x.com/font.woff2"));
+  assert(!isLikelyDocument("https://x.com/archive.zip"));
+  assert(!isLikelyDocument("https://x.com/script.js"));
+  assert(!isLikelyDocument("#top"));
+  assert(!isLikelyDocument("#section-1"));
 });
 
-Deno.test("hasDownloadableExtension: accepts .md fragment hint", () => {
-  assert(hasDownloadableExtension("https://x.com/docs/delete#delete.md"));
-  assert(hasDownloadableExtension("https://x.com/docs/page#anchor.mdx"));
-  assert(!hasDownloadableExtension("https://x.com/docs/page#section"));
+Deno.test("isLikelyDocument: ignores query and hash for extension check", () => {
+  assert(isLikelyDocument("https://x.com/a.md?x=1"));
+  assert(isLikelyDocument("https://x.com/docs/page#foo"));
+  assert(isLikelyDocument("https://x.com/docs/page#delete.md"));
+  assert(!isLikelyDocument("https://x.com/img.png?x=1"));
 });
 
-Deno.test("collectLinks: plain and reference-style", () => {
+Deno.test("collectLinks: only list-item links", () => {
   const md = [
     "# Title",
     "",
-    "[a](https://example.com/a.md)",
+    "Intro paragraph with [inline](https://example.com/inline.md) link.",
     "",
-    "[b][ref]",
+    "- [a](https://example.com/a.md)",
+    "- [b](https://example.com/b)",
+    "",
+  ].join("\n");
+  const tree = parseLlmsTxt(md);
+  const hrefs = collectLinks(tree).map((l) => l.href).sort();
+  assertEquals(hrefs, [
+    "https://example.com/a.md",
+    "https://example.com/b",
+  ]);
+});
+
+Deno.test("collectLinks: reference-style inside list", () => {
+  const md = [
+    "- [b][ref]",
     "",
     "[ref]: https://example.com/b.md",
     "",
   ].join("\n");
   const tree = parseLlmsTxt(md);
-  const links = collectLinks(tree);
-  const hrefs = links.map((l) => l.href).sort();
-  assertEquals(hrefs, [
-    "https://example.com/a.md",
-    "https://example.com/b.md",
-  ]);
-});
-
-Deno.test("collectLinks: GFM autolink / bare URL", () => {
-  const md = "See https://example.com/auto.md for details.\n";
-  const tree = parseLlmsTxt(md);
-  const hrefs = collectLinks(tree).map((l) => l.href);
-  assertEquals(hrefs, ["https://example.com/auto.md"]);
+  const hrefs = collectLinks(tree).map((l) => l.href).sort();
+  assert(hrefs.includes("https://example.com/b.md"));
 });
 
 Deno.test("collectLinks: ignores links inside fenced code blocks", () => {
@@ -71,7 +81,7 @@ Deno.test("collectLinks: ignores links inside fenced code blocks", () => {
     "[nope](https://example.com/nope.md)",
     "```",
     "",
-    "[yes](https://example.com/yes.md)",
+    "- [yes](https://example.com/yes.md)",
     "",
   ].join("\n");
   const tree = parseLlmsTxt(md);
@@ -83,7 +93,7 @@ Deno.test("collectLinks: ignores MDX JSX attributes", () => {
   const md = [
     '<Card href="https://example.com/jsx.md" />',
     "",
-    "[y](https://example.com/y.md)",
+    "- [y](https://example.com/y.md)",
     "",
   ].join("\n");
   const tree = parseLlmsTxt(md);
@@ -91,17 +101,21 @@ Deno.test("collectLinks: ignores MDX JSX attributes", () => {
   assertEquals(hrefs, ["https://example.com/y.md"]);
 });
 
-Deno.test("filterDownloadable", () => {
+Deno.test("filterDownloadable: keeps docs, drops assets", () => {
   const md = [
-    "[a](https://x.com/a.md)",
-    "[b](https://x.com/b.html)",
-    "[c](https://x.com/c.json)",
-  ].join("\n\n");
+    "- [a](https://x.com/a.md)",
+    "- [b](https://x.com/b.html)",
+    "- [c](https://x.com/c.json)",
+    "- [d](https://x.com/d)",
+    "- [e](https://x.com/e.png)",
+  ].join("\n");
   const tree = parseLlmsTxt(md);
   const filtered = filterDownloadable(collectLinks(tree));
   assertEquals(filtered.map((l) => l.href).sort(), [
     "https://x.com/a.md",
+    "https://x.com/b.html",
     "https://x.com/c.json",
+    "https://x.com/d",
   ]);
 });
 
@@ -133,7 +147,7 @@ Deno.test("urlToLocalPath: trailing slash gets index", () => {
 });
 
 Deno.test("rewriteNodes + stringify round-trip", () => {
-  const md = "[a](https://example.com/docs/a.md)\n";
+  const md = "- [a](https://example.com/docs/a.md)\n";
   const tree = parseLlmsTxt(md);
   const links = filterDownloadable(collectLinks(tree));
   const plan = links.map((l) => ({
@@ -182,7 +196,7 @@ Deno.test("run: downloads files and rewrites llms.txt (URL source)", async () =>
       "",
       "- [Intro](https://example.com/docs/intro.md)",
       "- [Config](https://example.com/config.json)",
-      "- [Ignored](https://example.com/page.html)",
+      "- [Logo](https://example.com/logo.png)",
       "",
     ].join("\n");
 
@@ -219,7 +233,7 @@ Deno.test("run: downloads files and rewrites llms.txt (URL source)", async () =>
 Deno.test("run: local llms.txt with --base-url", async () => {
   await withTempDir(async (dir) => {
     const src = join(dir, "llms.txt");
-    await Deno.writeTextFile(src, "[a](/a.md)\n");
+    await Deno.writeTextFile(src, "- [a](/a.md)\n");
 
     const fetchFn = stubFetch({
       "https://example.com/a.md": { body: "A" },
@@ -244,7 +258,7 @@ Deno.test("run: local llms.txt with --base-url", async () => {
 
 Deno.test("run: --no-clobber skips existing files", async () => {
   await withTempDir(async (dir) => {
-    const llmsTxt = "[a](https://example.com/a.md)\n";
+    const llmsTxt = "- [a](https://example.com/a.md)\n";
     const existing = join(dir, "a.md");
     await Deno.writeTextFile(existing, "ORIGINAL");
 
@@ -280,7 +294,7 @@ Deno.test("run: --no-clobber skips existing files", async () => {
 
 Deno.test("run: reports failures on non-200", async () => {
   await withTempDir(async (dir) => {
-    const llmsTxt = "[a](https://example.com/missing.md)\n";
+    const llmsTxt = "- [a](https://example.com/missing.md)\n";
     const fetchFn = stubFetch({
       "https://example.com/llms.txt": { body: llmsTxt },
       "https://example.com/missing.md": { status: 404, body: "nope" },
@@ -303,7 +317,7 @@ Deno.test("run: reports failures on non-200", async () => {
 Deno.test("run: local source with relative href + no base-url throws per-link", async () => {
   await withTempDir(async (dir) => {
     const src = join(dir, "llms.txt");
-    await Deno.writeTextFile(src, "[a](/a.md)\n[b](https://example.com/b.md)\n");
+    await Deno.writeTextFile(src, "- [a](/a.md)\n- [b](https://example.com/b.md)\n");
 
     const fetchFn = stubFetch({
       "https://example.com/b.md": { body: "B" },
@@ -341,7 +355,7 @@ Deno.test("run: throws on unreachable source URL", async () => {
 
 Deno.test("run: sends Accept: text/markdown header on all fetches", async () => {
   await withTempDir(async (dir) => {
-    const llmsTxt = "[a](https://example.com/a.md)\n";
+    const llmsTxt = "- [a](https://example.com/a.md)\n";
     const seenAccept: string[] = [];
     const fetchFn = ((input: string | URL | Request, init?: RequestInit) => {
       const headers = new Headers(init?.headers);
@@ -426,7 +440,7 @@ Deno.test("swapExtensionToMd", () => {
 
 Deno.test("run: converts HTML response to markdown and swaps extension", async () => {
   await withTempDir(async (dir) => {
-    const llmsTxt = "[a](https://example.com/a.md)\n";
+    const llmsTxt = "- [a](https://example.com/a.md)\n";
     const fetchFn = ((input: string | URL | Request) => {
       const url = typeof input === "string"
         ? input
@@ -470,7 +484,7 @@ Deno.test("run: converts HTML response to markdown and swaps extension", async (
 Deno.test("run: downloads and rewrites fragment-hint URLs (e.g. /page#name.md)", async () => {
   await withTempDir(async (dir) => {
     const llmsTxt =
-      "[a](https://example.com/docs/delete#delete.md)\n[b](https://example.com/docs/get#get.md)\n";
+      "- [a](https://example.com/docs/delete#delete.md)\n- [b](https://example.com/docs/get#get.md)\n";
     const fetchFn = ((input: string | URL | Request) => {
       const url = typeof input === "string"
         ? input
