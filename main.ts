@@ -12,7 +12,7 @@ import { visit } from "unist-util-visit";
 import { select } from "hast-util-select";
 import { toMdast } from "hast-util-to-mdast";
 
-export const VERSION = "0.1.2";
+export const VERSION = "0.1.4";
 
 const ACCEPT_HEADER = "text/markdown";
 
