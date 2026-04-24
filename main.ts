@@ -5,9 +5,14 @@ import { pooledMap } from "@std/async/pool";
 import { remark } from "remark";
 import remarkGfm from "remark-gfm";
 import remarkMdx from "remark-mdx";
+import remarkStringify from "remark-stringify";
+import rehypeParse from "rehype-parse";
+import { unified } from "unified";
 import { visit } from "unist-util-visit";
+import { select } from "hast-util-select";
+import { toMdast } from "hast-util-to-mdast";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 
 const ACCEPT_HEADER = "text/markdown";
 
@@ -114,6 +119,48 @@ export interface DownloadOptions {
   onResult?: (r: DownloadResult) => void;
 }
 
+export function isHtmlResponse(
+  contentType: string | null,
+  body: string,
+): boolean {
+  if (contentType) {
+    const ct = contentType.toLowerCase();
+    if (ct.includes("text/html") || ct.includes("application/xhtml")) {
+      return true;
+    }
+    if (ct.includes("text/markdown") || ct.includes("application/json")) {
+      return false;
+    }
+    if (ct.includes("yaml")) return false;
+  }
+  const head = body.slice(0, 1024).toLowerCase().trimStart();
+  return head.startsWith("<!doctype html") ||
+    head.startsWith("<html") ||
+    /<html[\s>]/i.test(body.slice(0, 2048));
+}
+
+export function htmlToMarkdown(html: string): string {
+  const hast = unified().use(rehypeParse, { fragment: false }).parse(html);
+  const root = select("article", hast) ??
+    select("main", hast) ??
+    select("body", hast) ??
+    hast;
+  const mdast = toMdast(root as never);
+  return String(
+    unified()
+      .use(remarkGfm)
+      .use(remarkStringify)
+      .stringify(mdast as never),
+  );
+}
+
+export function swapExtensionToMd(path: string): string {
+  const dot = path.lastIndexOf(".");
+  const slash = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  if (dot <= slash) return path + ".md";
+  return path.slice(0, dot) + ".md";
+}
+
 export async function downloadOne(
   item: DownloadPlanItem,
   opts: DownloadOptions,
@@ -127,14 +174,35 @@ export async function downloadOne(
       } catch (_) {
         // not exists, continue
       }
+      const mdPath = swapExtensionToMd(item.localPath);
+      if (mdPath !== item.localPath) {
+        try {
+          await Deno.stat(mdPath);
+          item.localPath = mdPath;
+          return { item, ok: true };
+        } catch (_) {
+          // not exists, continue
+        }
+      }
     }
     const res = await fetchFn(item.url);
     if (!res.ok) {
       return { item, ok: false, error: `HTTP ${res.status}` };
     }
-    const body = new Uint8Array(await res.arrayBuffer());
-    await ensureDir(dirname(item.localPath));
-    await Deno.writeFile(item.localPath, body);
+    const contentType = res.headers.get("content-type");
+    const text = await res.text();
+    let outPath = item.localPath;
+    let bodyBytes: Uint8Array;
+    if (isHtmlResponse(contentType, text)) {
+      const md = htmlToMarkdown(text);
+      outPath = swapExtensionToMd(item.localPath);
+      item.localPath = outPath;
+      bodyBytes = new TextEncoder().encode(md);
+    } else {
+      bodyBytes = new TextEncoder().encode(text);
+    }
+    await ensureDir(dirname(outPath));
+    await Deno.writeFile(outPath, bodyBytes);
     return { item, ok: true };
   } catch (err) {
     return { item, ok: false, error: (err as Error).message };

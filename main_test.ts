@@ -4,11 +4,14 @@ import {
   collectLinks,
   filterDownloadable,
   hasDownloadableExtension,
+  htmlToMarkdown,
+  isHtmlResponse,
   parseLlmsTxt,
   resolveHref,
   rewriteNodes,
   run,
   stringifyTree,
+  swapExtensionToMd,
   urlToLocalPath,
 } from "./main.ts";
 
@@ -359,5 +362,101 @@ Deno.test("run: sends Accept: text/markdown header on all fetches", async () => 
 
     assertEquals(seenAccept.length, 2);
     for (const a of seenAccept) assertEquals(a, "text/markdown");
+  });
+});
+
+Deno.test("isHtmlResponse: content-type detection", () => {
+  assert(isHtmlResponse("text/html; charset=utf-8", ""));
+  assert(isHtmlResponse("application/xhtml+xml", ""));
+  assert(!isHtmlResponse("text/markdown", "<html>oops</html>"));
+  assert(!isHtmlResponse("application/json", "{}"));
+  assert(!isHtmlResponse("text/yaml", "a: 1"));
+});
+
+Deno.test("isHtmlResponse: body sniff when no content-type", () => {
+  assert(isHtmlResponse(null, "<!DOCTYPE html><html></html>"));
+  assert(isHtmlResponse(null, "<html><body>x</body></html>"));
+  assert(!isHtmlResponse(null, "# markdown"));
+  assert(!isHtmlResponse(null, "{\n  \"x\": 1\n}"));
+});
+
+Deno.test("htmlToMarkdown: prefers <article>", () => {
+  const html = `<!DOCTYPE html><html><body>
+    <nav>skip</nav>
+    <main><p>main content</p></main>
+    <article><h1>Title</h1><p>Hello <strong>world</strong>.</p></article>
+    <footer>skip</footer>
+  </body></html>`;
+  const md = htmlToMarkdown(html);
+  assert(md.includes("# Title"), md);
+  assert(md.includes("Hello **world**."), md);
+  assert(!md.includes("main content"), md);
+  assert(!md.includes("skip"), md);
+});
+
+Deno.test("htmlToMarkdown: falls back to <main> when no <article>", () => {
+  const html = `<html><body>
+    <nav>skip</nav>
+    <main><h2>Main</h2><p>body text</p></main>
+  </body></html>`;
+  const md = htmlToMarkdown(html);
+  assert(md.includes("## Main"), md);
+  assert(md.includes("body text"), md);
+  assert(!md.includes("skip"), md);
+});
+
+Deno.test("htmlToMarkdown: falls back to <body> when no article/main", () => {
+  const html = "<html><body><p>only body</p></body></html>";
+  const md = htmlToMarkdown(html);
+  assert(md.includes("only body"), md);
+});
+
+Deno.test("swapExtensionToMd", () => {
+  assertEquals(swapExtensionToMd("/tmp/a.html"), "/tmp/a.md");
+  assertEquals(swapExtensionToMd("/tmp/a.mdx"), "/tmp/a.md");
+  assertEquals(swapExtensionToMd("/tmp/a"), "/tmp/a.md");
+  assertEquals(swapExtensionToMd("/tmp/dir.v1/a.html"), "/tmp/dir.v1/a.md");
+});
+
+Deno.test("run: converts HTML response to markdown and swaps extension", async () => {
+  await withTempDir(async (dir) => {
+    const llmsTxt = "[a](https://example.com/a.md)\n";
+    const fetchFn = ((input: string | URL | Request) => {
+      const url = typeof input === "string"
+        ? input
+        : input instanceof URL
+        ? input.href
+        : input.url;
+      if (url === "https://example.com/llms.txt") {
+        return Promise.resolve(
+          new Response(llmsTxt, {
+            headers: { "content-type": "text/markdown" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        new Response(
+          "<!DOCTYPE html><html><body><article><h1>Hi</h1><p>yo</p></article></body></html>",
+          { headers: { "content-type": "text/html; charset=utf-8" } },
+        ),
+      );
+    }) as unknown as typeof fetch;
+
+    const res = await run({
+      source: "https://example.com/llms.txt",
+      outDir: dir,
+      concurrency: 2,
+      noClobber: false,
+      fetchFn,
+      log: () => {},
+    });
+
+    assertEquals(res.written, 1);
+    const out = await Deno.readTextFile(join(dir, "a.md"));
+    assert(out.includes("# Hi"), out);
+    assert(out.includes("yo"), out);
+
+    const rewritten = await Deno.readTextFile(join(dir, "llms.txt"));
+    assert(rewritten.includes("./a.md"), rewritten);
   });
 });
